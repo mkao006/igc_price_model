@@ -1,10 +1,9 @@
 from __future__ import print_function
+import os
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 import matplotlib.pyplot as plt
-
-# Split the data into train, validate and test
 
 
 def split_data(data, response_col, train_prop, valid_prop):
@@ -28,7 +27,6 @@ def split_data(data, response_col, train_prop, valid_prop):
     return train_data, valid_data, pred_data
 
 
-# Create a generator to generate the batch.
 def batch_generator(data, batch_size, interval_size):
     ''' Returns a generator function of data for training and prediction.
     '''
@@ -79,9 +77,13 @@ goi_price = pd.read_csv('../../data/goi_price.csv')
 response_name = 'GOI'
 
 # Split the data
+#
+# NOTE (Michael): 50% for training, 47% for validating, and 3% for
+#                 prediction. The 3% was chosen to approximate 180
+#                 days for forecasting period.
 train_data, test_data, pred_data = split_data(data=goi_price,
                                               response_col=response_name,
-                                              train_prop=0.5, valid_prop=0.3)
+                                              train_prop=0.5, valid_prop=0.47)
 
 
 # Initialise parameters
@@ -98,6 +100,7 @@ with tf.Session(graph=graph) as sess:
     # Create input and target placeholder
     input_ = tf.placeholder(tf.float32, shape=[None, None, 1], name='input')
     target_ = tf.placeholder(tf.float32, shape=[None, 1], name='target')
+    batch_size_ = tf.placeholder(tf.int32, shape=(), name='batch_size')
 
     # normalise the data and create the denormaliser
     scaled_input, denomarliser = scaler(input_)
@@ -106,7 +109,7 @@ with tf.Session(graph=graph) as sess:
     lstm = tf.contrib.rnn.MultiRNNCell(
         cells=[tf.contrib.rnn.BasicLSTMCell(num_units=cell_size)
                for l in range(num_layers)])
-    initial_state = lstm.zero_state(batch_size=batch_size,
+    initial_state = lstm.zero_state(batch_size=batch_size_,
                                     dtype=tf.float32)
     output, final_state = tf.nn.dynamic_rnn(cell=lstm,
                                             inputs=scaled_input,
@@ -129,19 +132,24 @@ with tf.Session(graph=graph) as sess:
 
 
 # Train the LSTM
+#
+# NOTE (Michael): The large difference between the train and test loss
+#                 suggests the model is over-fitting.
 with tf.Session(graph=graph) as sess:
     sess.run(tf.global_variables_initializer())
-
+    saver = tf.train.Saver()
     for e in range(epochs):
         train_generator = batch_generator(
             data=train_data, interval_size=interval_size,
             batch_size=batch_size)
-        train_state = sess.run(initial_state)
+        train_state = sess.run(initial_state,
+                               feed_dict={batch_size_: batch_size})
         for train_batch, (train_input, train_target) in enumerate(train_generator):
             train_loss, train_pred, _, train_state = sess.run(
                 [loss, pred, optimiser, final_state],
                 feed_dict={input_: train_input,
                            target_: train_target,
+                           batch_size_: batch_size,
                            initial_state: train_state})
 
         test_state = train_state
@@ -154,15 +162,40 @@ with tf.Session(graph=graph) as sess:
                 [loss, pred, final_state],
                 feed_dict={input_: test_input,
                            target_: test_target,
+                           batch_size_: batch_size,
                            initial_state: test_state})
 
         print('Epoch: {}/{}'.format(e + 1, epochs),
               'Train loss: {:.3f}'.format(train_loss),
               'Test loss: {:.3f}'.format(test_loss))
 
+    if not os.path.exists('checkpoints/'):
+        os.mkdir('checkpoints')
+
+    saver.save(sess, 'checkpoints/univariate/univariate.ckpt')
+
+# Make rolling prediction
+with tf.Session(graph=graph) as sess:
+    saver.restore(sess, tf.train.latest_checkpoint('checkpoints/univariate'))
+    prediction = np.empty(0)
+    initial_input = np.array(pred_data.iloc[:interval_size])
+    num_slide = len(pred_data) - interval_size
+    for slide in range(num_slide):
+        current_input = np.concatenate(
+            [initial_input, prediction])[-interval_size:].reshape(1, -1, 1)
+        current_pred = sess.run(pred,
+                                feed_dict={input_: current_input,
+                                           batch_size_: 1})
+        prediction = np.append(prediction, current_pred)
+
+
 # Plot the prediction
-prediction_df = pd.DataFrame({'pred': test_pred.reshape(1, -1).tolist()[0],
-                              'actual': test_target.reshape(1, -1).tolist()[0]})
+#
+# NOTE (Michael): The prediction is non-sensical, further extremely
+#                 unstable. However, this is what one would expect to
+#                 make a rolling forecast of any model.
+prediction_df = pd.DataFrame({'pred': prediction.reshape(1, -1).tolist()[0],
+                              'actual': pred_data[interval_size:].tolist()})
 
 plt.plot(prediction_df['pred'])
 plt.plot(prediction_df['actual'])
